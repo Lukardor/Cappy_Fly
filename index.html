@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#4fc3f7">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Capy Fly">
+<title>Capy Fly</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+    /* Letterbox colors match sky (top) and brick ground (bottom) on phones */
+    background: linear-gradient(#4fc3f7 0 50%, #8e3d1f 50% 100%);
+  }
+  body {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+  }
+  body.framed { background: radial-gradient(circle at 50% 40%, #24384a, #0d151d); }
+  #stage {
+    position: fixed;
+    top: env(safe-area-inset-top, 0px);
+    right: env(safe-area-inset-right, 0px);
+    bottom: env(safe-area-inset-bottom, 0px);
+    left: env(safe-area-inset-left, 0px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas { display: block; touch-action: none; outline: none; }
+  body.framed canvas {
+    border-radius: 36px;
+    box-shadow: 0 0 0 10px #10161d, 0 0 0 12px #2c3a48, 0 24px 60px rgba(0, 0, 0, .55);
+  }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="game" tabindex="0" aria-label="Capy Fly Spiel"></canvas></div>
+<script>
+'use strict';
+
+/* =====================================================================
+ * CONFIGURATION
+ * ===================================================================== */
+const CFG = {
+  W: 360,               // fixed logical width
+  H_MIN: 640,           // logical height range: tall phones get a taller playfield
+  H_MAX: 780,
+  GRAVITY: 1550,        // px/s^2
+  FLAP_VY: -430,        // px/s, upward impulse on flap
+  MAX_FALL: 720,        // px/s terminal velocity
+  PIPE_W: 62,
+  HEAD_W: 74,           // pipe "head" is slightly wider than the body
+  HEAD_H: 26,
+  GAP: 168,             // vertical opening between pipes
+  GAP_JUMP: 150,        // max vertical shift of the gap between consecutive pipes
+  PIPE_SPACING: 205,    // horizontal distance between pipe pairs
+  SPEED_BASE: 150,      // px/s
+  SPEED_STEP: 12,       // added every 10 points
+  SPEED_MAX: 270,
+  GRASS_H: 22,
+  CAPY_X: 0.3,          // horizontal position as a fraction of width
+  PX: 3,                // capybara pixel size
+  HIT_HW: 18,           // forgiving hitbox half-extents
+  HIT_HH: 13,
+  STUD: 16,             // lego stud grid size
+  BTN: 48,
+  STEP: 1 / 120,        // fixed physics sub-step
+  STORE_BEST: 'capyfly.best',
+  STORE_MUTE: 'capyfly.muted',
+};
+
+const C = {
+  skyTop: '#3fb6f2', skyBottom: '#8fe0ff',
+  cloud: '#ffffff', cloudShade: '#d6efff',
+  hillBack: '#a9e3b6', hillFront: '#86d39c',
+  bush: '#2f8a58',
+  pipe: '#56c93e', pipeLight: '#7fdd5e', pipeShade: '#3fa52c', pipeDark: '#1f5e17',
+  stud: '#66d84b', studHi: '#a2ef84', studLo: '#36921f',
+  grass: '#6ccf3f', grassHi: '#9be86f', grassDark: '#2f7a22',
+  brick: '#b4542d', brickHi: '#cd6c41', mortar: '#7a3418',
+  ink: '#1b2633',
+  btnTop: '#5bb4ff', btnBottom: '#1f6fe0', btnDark: '#0c2b5c',
+  sign: '#e8676a', signHi: '#f4999a', signDark: '#4a1416',
+  panel: '#fff4d6', panelDark: '#3a2a14', label: '#b56a24',
+  green1: '#7be35a', green2: '#34a524', greenDark: '#164f10',
+};
+
+const FONT = '"Arial Black", "Segoe UI Black", "Helvetica Neue", system-ui, sans-serif';
+
+// Capybara sprite (facing right). O body, L highlight, D dark fur, E eye, N snout, T side marking
+const CAPY_MAP = [
+  '...........DD...',
+  '...OOOOOOOOOOOO.',
+  '..OLLLLLLLLLOOOO',
+  '.OOOOOOOOOOOOEOO',
+  '.OOTTTTOOOOOOOOO',
+  '.OOOOTOOOOOOOONN',
+  '.OOOOTOOOOOOOONN',
+  '.DOOOOOOOOOOOOO.',
+  '..DDDDDDDDDDDD..',
+  '..DD.DD...DD.DD.',
+];
+const CAPY_COLORS = { O: '#e08a3a', L: '#f4b062', D: '#b8622a', E: '#24140a', N: '#4a2614', T: '#93451a' };
+const CAPY_OUTLINE = '#3b1d0b';
+
+/* =====================================================================
+ * STATE
+ * ===================================================================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const stage = document.getElementById('stage');
+
+const W = CFG.W;
+let H = CFG.H_MIN;
+const L = {};                 // layout values derived from H
+let scale = 1;
+
+const motionQuery = window.matchMedia ? matchMedia('(prefers-reduced-motion: reduce)') : null;
+let reducedMotion = !!(motionQuery && motionQuery.matches);
+if (motionQuery) {
+  const onChange = e => { reducedMotion = e.matches; };
+  if (motionQuery.addEventListener) motionQuery.addEventListener('change', onChange);
+  else if (motionQuery.addListener) motionQuery.addListener(onChange);
+}
+
+function storeGet(key, fallback) {
+  try { const v = localStorage.getItem(key); return v === null ? fallback : v; } catch (e) { return fallback; }
+}
+function storeSet(key, value) {
+  try { localStorage.setItem(key, String(value)); } catch (e) { /* storage unavailable */ }
+}
+
+const game = {
+  state: 'ready',            // ready | play | paused | over
+  t: 0,
+  score: 0,
+  best: parseInt(storeGet(CFG.STORE_BEST, '0'), 10) || 0,
+  newBest: false,
+  speed: CFG.SPEED_BASE,
+  pipes: [],
+  dist: 0,
+  lastGapY: 0,
+  overT: 0,
+  flash: 0,
+  shake: 0,
+  scorePop: 0,
+  groundX: 0,
+  hillX: 0,
+  bushX: 0,
+  pressed: null,
+  pressedT: 0,
+};
+
+const capy = { x: 0, y: 0, vy: 0, rot: 0, wing: 0, wingBoost: 0 };
+let clouds = [];
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const hash = n => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };
+const easeOutBack = t => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+
+/* =====================================================================
+ * LAYOUT / RESIZE
+ * ===================================================================== */
+function resize() {
+  const aw = stage.clientWidth;
+  const ah = stage.clientHeight;
+  const coarse = window.matchMedia && matchMedia('(pointer: coarse)').matches;
+  const framed = aw >= 700 && !coarse;
+  document.body.classList.toggle('framed', framed);
+
+  const pad = framed ? 56 : 0;
+  const w = Math.max(100, aw - pad);
+  const h = Math.max(100, ah - pad);
+
+  // Width is fixed; height stretches within a range so tall phones are filled edge to edge
+  H = Math.round(clamp(W * h / w, CFG.H_MIN, CFG.H_MAX));
+  const s = Math.min(w / W, h / H);
+  const cssW = Math.floor(W * s);
+  const cssH = Math.floor(H * s);
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  scale = canvas.width / W;
+  layout();
+}
+
+function layout() {
+  L.groundY = H - 80;
+  L.readyY = Math.round(H * 0.44);
+  L.gapMin = CFG.GAP / 2 + 100;
+  L.gapMax = L.groundY - CFG.GAP / 2 - 50;
+  const b = CFG.BTN, by = 52;
+  L.buttons = [
+    { id: 'back',  x: 14,             y: by, w: b, h: b },
+    { id: 'pause', x: (W - b) / 2,    y: by, w: b, h: b },
+    { id: 'sound', x: W - 14 - b,     y: by, w: b, h: b },
+  ];
+  L.restart = { id: 'restart', x: W / 2 - 84, y: 0, w: 168, h: 54 };
+  capy.x = Math.round(W * CFG.CAPY_X);
+  if (game.state === 'ready') capy.y = L.readyY;
+  capy.y = Math.min(capy.y, L.groundY - CFG.HIT_HH);
+}
+
+function initClouds() {
+  clouds = [];
+  for (let i = 0; i < 7; i++) {
+    const depth = 0.25 + Math.random() * 0.75;
+    clouds.push({
+      x: Math.random() * (W + 120) - 60,
+      y: 110 + Math.random() * Math.max(80, L.groundY - 320),
+      depth,
+      speed: 6 + 26 * depth,
+      s: 0.5 + 0.7 * depth,
+    });
+  }
+  clouds.sort((a, b) => a.depth - b.depth);   // far clouds first
+}
+
+/* =====================================================================
+ * DRAWING
+ * ===================================================================== */
+function roundRectPath(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function outlinedText(txt, x, y, size, fill = '#fff', stroke = C.ink, lw = size * 0.2, depth = 0) {
+  ctx.font = `900 ${size}px ${FONT}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = lw;
+  ctx.strokeStyle = stroke;
+  if (depth) {
+    ctx.fillStyle = stroke;
+    ctx.strokeText(txt, x, y + depth);
+    ctx.fillText(txt, x, y + depth);
+  }
+  ctx.strokeText(txt, x, y);
+  ctx.fillStyle = fill;
+  ctx.fillText(txt, x, y);
+}
+
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, L.groundY);
+  g.addColorStop(0, C.skyTop);
+  g.addColorStop(1, C.skyBottom);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawCloud(c) {
+  const s = c.s;
+  ctx.save();
+  ctx.translate(c.x, c.y);
+  ctx.scale(s, s);
+  ctx.globalAlpha = 0.55 + 0.45 * c.depth;
+  const blobs = [[0, 0, 20], [22, -12, 24], [46, -4, 20], [64, 4, 15], [-16, 6, 13]];
+  // soft underside shade
+  ctx.fillStyle = C.cloudShade;
+  ctx.beginPath();
+  for (const [bx, by, r] of blobs) { ctx.moveTo(bx + r, by + 4); ctx.arc(bx, by + 4, r, 0, Math.PI * 2); }
+  ctx.rect(-16, 4, 80, 18);
+  ctx.fill();
+  ctx.fillStyle = C.cloud;
+  ctx.beginPath();
+  for (const [bx, by, r] of blobs) { ctx.moveTo(bx + r, by); ctx.arc(bx, by, r, 0, Math.PI * 2); }
+  ctx.rect(-16, 0, 80, 16);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawHills() {
+  const base = L.groundY + 2;
+  // Back layer: smooth rolling hills
+  ctx.fillStyle = C.hillBack;
+  ctx.beginPath();
+  ctx.moveTo(0, base);
+  for (let x = 0; x <= W + 6; x += 6) {
+    const u = x + game.hillX * 0.5;
+    ctx.lineTo(x, base - 150 + Math.sin(u * 0.011) * 22 + Math.sin(u * 0.027 + 1.3) * 8);
+  }
+  ctx.lineTo(W, base);
+  ctx.closePath();
+  ctx.fill();
+  // Front layer: scalloped, bush-like bumps
+  ctx.fillStyle = C.hillFront;
+  ctx.beginPath();
+  ctx.moveTo(0, base);
+  for (let x = 0; x <= W + 4; x += 4) {
+    const u = x + game.hillX;
+    ctx.lineTo(x, base - 92 - Math.abs(Math.sin(u * 0.022)) * 30 - Math.sin(u * 0.006) * 10);
+  }
+  ctx.lineTo(W, base);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawSprout(x, y, s) {
+  ctx.beginPath();
+  ctx.ellipse(x, y - 13 * s, 5 * s, 14 * s, 0, 0, Math.PI * 2);
+  ctx.ellipse(x - 8 * s, y - 8 * s, 4 * s, 11 * s, -0.75, 0, Math.PI * 2);
+  ctx.ellipse(x + 8 * s, y - 8 * s, 4 * s, 11 * s, 0.75, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawBushes() {
+  const spacing = 78;
+  const first = Math.floor(game.bushX / spacing) - 1;
+  const off = game.bushX;
+  ctx.fillStyle = C.bush;
+  for (let i = first; i < first + Math.ceil(W / spacing) + 3; i++) {
+    const x = i * spacing - off + hash(i) * 36;
+    drawSprout(x, L.groundY + 2, 0.7 + hash(i + 50) * 0.6);
+  }
+}
+
+function drawStud(x, y, top, hi, lo) {
+  ctx.fillStyle = lo; ctx.fillRect(x + 1.5, y + 1.5, 8, 8);
+  ctx.fillStyle = top; ctx.fillRect(x, y, 8, 8);
+  ctx.fillStyle = hi; ctx.fillRect(x, y, 8, 2); ctx.fillRect(x, y, 2, 8);
+}
+
+// A lego-style green block with a stud grid, side shading and dark outline
+function drawLegoBlock(x, y, w, h, isHead) {
+  if (h <= 0) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+  ctx.fillStyle = C.pipe;
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = C.pipeLight;
+  ctx.fillRect(x + 3, y, 6, h);
+  ctx.fillStyle = C.pipeShade;
+  ctx.fillRect(x + w - 11, y, 8, h);
+
+  const s = CFG.STUD;
+  const cols = Math.floor((w - 6) / s);
+  const ox = x + (w - cols * s) / 2 + 4;
+  if (isHead) {
+    for (let c = 0; c < cols; c++) drawStud(ox + c * s, y + 8, C.stud, C.studHi, C.studLo);
+    ctx.fillStyle = C.pipeShade;
+    ctx.fillRect(x, y + h - 5, w, 5);
+  } else {
+    for (let yy = Math.floor(y / s) * s; yy < y + h; yy += s) {
+      for (let c = 0; c < cols; c++) drawStud(ox + c * s, yy + 4, C.stud, C.studHi, C.studLo);
+    }
+  }
+  ctx.restore();
+  ctx.strokeStyle = C.pipeDark;
+  ctx.lineWidth = 3;
+  ctx.strokeRect(x + 1.5, y + 1.5, w - 3, h - 3);
+}
+
+function drawPipe(p) {
+  const gt = p.gapY - CFG.GAP / 2;
+  const gb = p.gapY + CFG.GAP / 2;
+  const o = (CFG.HEAD_W - CFG.PIPE_W) / 2;
+  drawLegoBlock(p.x, -6, CFG.PIPE_W, gt - CFG.HEAD_H + 8, false);
+  drawLegoBlock(p.x - o, gt - CFG.HEAD_H, CFG.HEAD_W, CFG.HEAD_H, true);
+  drawLegoBlock(p.x, gb + CFG.HEAD_H - 2, CFG.PIPE_W, L.groundY - gb - CFG.HEAD_H + 4, false);
+  drawLegoBlock(p.x - o, gb, CFG.HEAD_W, CFG.HEAD_H, true);
+}
+
+function drawGround() {
+  const gy = L.groundY;
+  // Grass strip with lego studs
+  ctx.fillStyle = C.grass;
+  ctx.fillRect(0, gy, W, CFG.GRASS_H);
+  const off = -(game.groundX % 16);
+  for (let x = off; x < W; x += 16) drawStud(x + 4, gy + 7, C.grass, C.grassHi, C.grassDark);
+  ctx.fillStyle = C.grassDark;
+  ctx.fillRect(0, gy, W, 3);
+  ctx.fillRect(0, gy + CFG.GRASS_H - 3, W, 3);
+
+  // Red-brown brick layer
+  const by = gy + CFG.GRASS_H;
+  ctx.fillStyle = C.brick;
+  ctx.fillRect(0, by, W, H - by);
+  const bw = 32, bh = 14;
+  for (let r = 0; by + r * bh < H; r++) {
+    const y = by + r * bh;
+    const shift = (game.groundX + (r % 2) * 16) % bw;
+    for (let x = -shift; x < W; x += bw) {
+      ctx.fillStyle = C.brickHi;
+      ctx.fillRect(x + 3, y + 3, bw - 7, 2);
+      ctx.fillStyle = C.mortar;
+      ctx.fillRect(x, y, 2, bh);
+    }
+    ctx.fillStyle = C.mortar;
+    ctx.fillRect(0, y + bh - 2, W, 2);
+  }
+}
+
+function drawWing(flapAngle, color, edge) {
+  ctx.save();
+  ctx.rotate(-0.35 + flapAngle);
+  ctx.fillStyle = edge;
+  roundRectPath(-17, -5, 19, 8, 4); ctx.fill();
+  roundRectPath(-14, -11, 15, 7, 3.5); ctx.fill();
+  roundRectPath(-10, -16, 11, 6, 3); ctx.fill();
+  ctx.fillStyle = color;
+  roundRectPath(-15.5, -3.5, 16, 5, 2.5); ctx.fill();
+  roundRectPath(-12.5, -9.5, 12, 4, 2); ctx.fill();
+  roundRectPath(-8.5, -14.5, 8, 3, 1.5); ctx.fill();
+  ctx.restore();
+}
+
+function drawCapy() {
+  const P = CFG.PX;
+  const cols = CAPY_MAP[0].length, rows = CAPY_MAP.length;
+  const ox = -cols * P / 2, oy = -rows * P / 2;
+  const flap = Math.sin(capy.wing) * 0.75;
+
+  ctx.save();
+  ctx.translate(capy.x, capy.y);
+  ctx.rotate(capy.rot);
+  ctx.scale(1.2, 1.2);
+
+  // back wing (behind the body)
+  ctx.save();
+  ctx.translate(-4, -12);
+  drawWing(flap * 0.8 - 0.15, '#e3ecf5', '#8ea3b8');
+  ctx.restore();
+
+  // outline pass, then color pass for a crisp pixel-art look
+  ctx.fillStyle = CAPY_OUTLINE;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (CAPY_MAP[r][c] !== '.') ctx.fillRect(ox + c * P - 1.5, oy + r * P - 1.5, P + 3, P + 3);
+    }
+  }
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const k = CAPY_MAP[r][c];
+      if (k === '.') continue;
+      ctx.fillStyle = CAPY_COLORS[k];
+      ctx.fillRect(ox + c * P, oy + r * P, P + 0.3, P + 0.3);
+    }
+  }
+  // eye sparkle
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(ox + 13 * P, oy + 3 * P, 1.2, 1.2);
+
+  // front wing
+  ctx.save();
+  ctx.translate(-1, -11);
+  drawWing(flap, '#ffffff', '#7f93a8');
+  ctx.restore();
+
+  ctx.restore();
+}
+
+/* =====================================================================
+ * UI
+ * ===================================================================== */
+function isPressed(id) { return game.pressed === id && game.t < game.pressedT; }
+
+function drawButton(b, icon) {
+  const down = isPressed(b.id) ? 2 : 0;
+  const x = b.x, y = b.y + down;
+  // drop shadow
+  if (!down) {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+    roundRectPath(x + 1, y + 4, b.w, b.h, 11); ctx.fill();
+  }
+  ctx.fillStyle = C.btnDark;
+  roundRectPath(x - 1.5, y - 1.5, b.w + 3, b.h + 3, 12); ctx.fill();
+  const g = ctx.createLinearGradient(0, y, 0, y + b.h);
+  g.addColorStop(0, C.btnTop);
+  g.addColorStop(1, C.btnBottom);
+  ctx.fillStyle = g;
+  roundRectPath(x + 1.5, y + 1.5, b.w - 3, b.h - 3, 9); ctx.fill();
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.28)';
+  roundRectPath(x + 5, y + 4, b.w - 10, 9, 4.5); ctx.fill();
+
+  const cx = x + b.w / 2, cy = y + b.h / 2 + 1;
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#fff';
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  if (icon === 'back') {
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(cx + 5, cy - 11); ctx.lineTo(cx - 6, cy); ctx.lineTo(cx + 5, cy + 11);
+    ctx.stroke();
+  } else if (icon === 'pause') {
+    roundRectPath(cx - 10, cy - 12, 7, 24, 2); ctx.fill();
+    roundRectPath(cx + 3, cy - 12, 7, 24, 2); ctx.fill();
+  } else if (icon === 'play') {
+    ctx.beginPath();
+    ctx.moveTo(cx - 7, cy - 12); ctx.lineTo(cx + 11, cy); ctx.lineTo(cx - 7, cy + 12);
+    ctx.closePath(); ctx.fill();
+  } else if (icon === 'sound' || icon === 'mute') {
+    ctx.beginPath();
+    ctx.moveTo(cx - 14, cy - 5); ctx.lineTo(cx - 8, cy - 5); ctx.lineTo(cx, cy - 12);
+    ctx.lineTo(cx, cy + 12); ctx.lineTo(cx - 8, cy + 5); ctx.lineTo(cx - 14, cy + 5);
+    ctx.closePath(); ctx.fill();
+    ctx.lineWidth = 3;
+    if (icon === 'sound') {
+      ctx.beginPath(); ctx.arc(cx + 2, cy, 7, -0.9, 0.9); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx + 2, cy, 13, -0.9, 0.9); ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(cx + 5, cy - 6); ctx.lineTo(cx + 15, cy + 6);
+      ctx.moveTo(cx + 15, cy - 6); ctx.lineTo(cx + 5, cy + 6);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawSign() {
+  const w = 132, h = 34, x = (W - w) / 2, y = 8;
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.22)';
+  roundRectPath(x - 2, y + 2, w + 4, h + 4, 6); ctx.fill();
+  ctx.fillStyle = C.signDark;
+  roundRectPath(x - 3, y - 3, w + 6, h + 6, 7); ctx.fill();
+  ctx.fillStyle = C.sign;
+  roundRectPath(x, y, w, h, 4); ctx.fill();
+  ctx.fillStyle = C.signHi;
+  ctx.fillRect(x + 4, y + 3, w - 8, 3);
+  // little screws
+  ctx.fillStyle = C.signDark;
+  ctx.fillRect(x + 5, y + h / 2 - 1.5, 3, 3);
+  ctx.fillRect(x + w - 8, y + h / 2 - 1.5, 3, 3);
+  outlinedText('AUSGANG', W / 2, y + h / 2 + 1, 19, '#fff', C.ink, 5);
+}
+
+function drawHud() {
+  drawSign();
+  const [back, pause, sound] = L.buttons;
+  drawButton(back, 'back');
+  drawButton(pause, game.state === 'paused' ? 'play' : 'pause');
+  drawButton(sound, Sfx.muted ? 'mute' : 'sound');
+
+  if (game.state === 'play' || game.state === 'paused') {
+    const pop = 1 + game.scorePop * 0.25;
+    ctx.save();
+    ctx.translate(W / 2, 152);
+    ctx.scale(pop, pop);
+    outlinedText(String(game.score), 0, 0, 64, '#fff', C.ink, 11, 4);
+    ctx.restore();
+  }
+}
+
+function drawReady() {
+  const bob = reducedMotion ? 0 : Math.sin(game.t * 2) * 4;
+  ctx.save();
+  ctx.translate(W / 2, 168 + bob);
+  ctx.rotate(-0.04);
+  outlinedText('Capy Fly', 0, 0, 54, '#ffb347', C.ink, 11, 5);
+  ctx.restore();
+
+  const a = 0.55 + 0.45 * Math.abs(Math.sin(game.t * 2.6));
+  ctx.globalAlpha = a;
+  outlinedText('Tippen zum Starten', W / 2, L.readyY + 86, 22, '#fff', C.ink, 6);
+  ctx.globalAlpha = 1;
+  if (game.best > 0) outlinedText('Bestwert: ' + game.best, W / 2, L.readyY + 124, 17, '#fff4d6', C.ink, 5);
+
+  // tap hint finger
+  const fy = L.readyY + 168 + (reducedMotion ? 0 : Math.abs(Math.sin(game.t * 3)) * -8);
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = C.ink;
+  ctx.lineWidth = 3;
+  roundRectPath(W / 2 - 5, fy - 18, 10, 22, 5); ctx.fill(); ctx.stroke();
+  roundRectPath(W / 2 - 12, fy - 2, 26, 22, 8); ctx.fill(); ctx.stroke();
+}
+
+function drawPaused() {
+  ctx.fillStyle = 'rgba(10, 30, 50, 0.45)';
+  ctx.fillRect(0, 0, W, H);
+  outlinedText('Pausiert', W / 2, H * 0.42, 50, '#fff', C.ink, 10, 4);
+  outlinedText('Tippen zum Fortsetzen', W / 2, H * 0.42 + 56, 19, '#fff', C.ink, 5);
+  drawHud();   // keep the buttons usable above the overlay
+}
+
+function drawGameOver() {
+  const t = clamp(game.overT / 0.45, 0, 1);
+  const e = easeOutBack(t);
+  const pw = 270, ph = 236;
+  const px = (W - pw) / 2;
+  const py = Math.round(H * 0.3) + (1 - e) * H * 0.7;
+
+  ctx.globalAlpha = t;
+  outlinedText('Game Over', W / 2, py - 46, 48, '#ff7a59', C.ink, 10, 4);
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+  roundRectPath(px + 2, py + 6, pw, ph, 20); ctx.fill();
+  ctx.fillStyle = C.panelDark;
+  roundRectPath(px - 2, py - 2, pw + 4, ph + 4, 22); ctx.fill();
+  ctx.fillStyle = C.panel;
+  roundRectPath(px + 2, py + 2, pw - 4, ph - 4, 18); ctx.fill();
+
+  ctx.font = `900 15px ${FONT}`;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = C.label;
+  ctx.fillText('PUNKTE', W / 2 - 64, py + 30);
+  ctx.fillText('BESTWERT', W / 2 + 64, py + 30);
+  outlinedText(String(game.score), W / 2 - 64, py + 72, 40, '#fff', C.ink, 8, 3);
+  outlinedText(String(game.best), W / 2 + 64, py + 72, 40, '#fff', C.ink, 8, 3);
+
+  if (game.newBest) {
+    ctx.save();
+    ctx.translate(W / 2 + 104, py + 44);
+    ctx.rotate(0.3);
+    ctx.fillStyle = C.ink;
+    roundRectPath(-24, -12, 48, 24, 6); ctx.fill();
+    ctx.fillStyle = '#ff4f5e';
+    roundRectPath(-21, -9, 42, 18, 4); ctx.fill();
+    outlinedText('NEU!', 0, 1, 13, '#fff', C.ink, 3);
+    ctx.restore();
+  }
+
+  // Restart button
+  const b = L.restart;
+  b.y = py + ph - 84;
+  const ready = game.overT > 0.6;
+  const down = isPressed('restart') ? 2 : 0;
+  ctx.globalAlpha = ready ? 1 : 0.6;
+  if (!down) {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+    roundRectPath(b.x + 1, b.y + 5, b.w, b.h, 14); ctx.fill();
+  }
+  ctx.fillStyle = C.greenDark;
+  roundRectPath(b.x - 2, b.y - 2 + down, b.w + 4, b.h + 4, 15); ctx.fill();
+  const g = ctx.createLinearGradient(0, b.y, 0, b.y + b.h);
+  g.addColorStop(0, C.green1);
+  g.addColorStop(1, C.green2);
+  ctx.fillStyle = g;
+  roundRectPath(b.x + 1, b.y + 1 + down, b.w - 2, b.h - 2, 12); ctx.fill();
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+  roundRectPath(b.x + 8, b.y + 5 + down, b.w - 16, 10, 5); ctx.fill();
+  outlinedText('Neustart', W / 2, b.y + b.h / 2 + 2 + down, 24, '#fff', C.greenDark, 6);
+  ctx.globalAlpha = 1;
+
+  ctx.font = `700 13px ${FONT}`;
+  ctx.fillStyle = C.label;
+  ctx.fillText('Geschwindigkeit: Stufe ' + (Math.floor(game.score / 10) + 1), W / 2, py + 118);
+}
+
+function render() {
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.save();
+  if (game.shake > 0 && !reducedMotion) {
+    const m = game.shake * 7;
+    ctx.translate((Math.random() - 0.5) * m, (Math.random() - 0.5) * m);
+  }
+  drawSky();
+  for (const c of clouds) drawCloud(c);
+  drawHills();
+  drawBushes();
+  for (const p of game.pipes) drawPipe(p);
+  drawGround();
+  drawCapy();
+  ctx.restore();
+
+  if (game.flash > 0) {
+    ctx.fillStyle = `rgba(255, 255, 255, ${game.flash * 0.7})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (game.state === 'paused') {
+    drawPaused();
+    return;
+  }
+  drawHud();
+  if (game.state === 'ready') drawReady();
+  if (game.state === 'over') drawGameOver();
+}
+
+/* =====================================================================
+ * PHYSICS / GAME LOGIC
+ * ===================================================================== */
+function resetRun() {
+  game.state = 'ready';
+  game.score = 0;
+  game.newBest = false;
+  game.speed = CFG.SPEED_BASE;
+  game.pipes = [];
+  game.dist = CFG.PIPE_SPACING - 120;     // first pipe appears shortly after start
+  game.lastGapY = (L.gapMin + L.gapMax) / 2;
+  game.overT = 0;
+  capy.y = L.readyY;
+  capy.vy = 0;
+  capy.rot = 0;
+}
+
+function startRun() {
+  game.state = 'play';
+  flap();
+}
+
+function flap() {
+  capy.vy = CFG.FLAP_VY;
+  capy.wingBoost = 1;
+  Sfx.flap();
+}
+
+function spawnPipe(x) {
+  const j = CFG.GAP_JUMP;
+  const gapY = clamp(game.lastGapY + (Math.random() * 2 - 1) * j, L.gapMin, L.gapMax);
+  game.lastGapY = gapY;
+  game.pipes.push({ x, gapY, scored: false });
+}
+
+function hitsPipe(p) {
+  const l = capy.x - CFG.HIT_HW, r = capy.x + CFG.HIT_HW;
+  const t = capy.y - CFG.HIT_HH, b = capy.y + CFG.HIT_HH;
+  const gt = p.gapY - CFG.GAP / 2, gb = p.gapY + CFG.GAP / 2;
+  const o = (CFG.HEAD_W - CFG.PIPE_W) / 2;
+  const overlap = (x0, y0, x1, y1) => r > x0 && l < x1 && b > y0 && t < y1;
+  return overlap(p.x, -100, p.x + CFG.PIPE_W, gt) ||
+         overlap(p.x - o, gt - CFG.HEAD_H, p.x + CFG.PIPE_W + o, gt) ||
+         overlap(p.x, gb, p.x + CFG.PIPE_W, L.groundY) ||
+         overlap(p.x - o, gb, p.x + CFG.PIPE_W + o, gb + CFG.HEAD_H);
+}
+
+function gameOver() {
+  game.state = 'over';
+  game.overT = 0;
+  game.flash = 1;
+  game.shake = 1;
+  Sfx.hit();
+  if (navigator.vibrate) { try { navigator.vibrate(60); } catch (e) { /* ignore */ } }
+  if (game.score > game.best) {
+    game.best = game.score;
+    game.newBest = true;
+    storeSet(CFG.STORE_BEST, game.best);
+  }
+}
+
+function update(dt) {
+  game.t += dt;
+  if (game.state === 'paused') return;
+
+  const motion = reducedMotion ? 0.25 : 1;     // slower parallax for reduced motion
+  const scrolling = game.state === 'ready' || game.state === 'play';
+  const sp = scrolling ? game.speed : 0;
+
+  // Background parallax
+  for (const c of clouds) {
+    c.x -= c.speed * motion * dt;
+    if (c.x < -110) {
+      c.x = W + 60 + Math.random() * 80;
+      c.y = 110 + Math.random() * Math.max(80, L.groundY - 320);
+    }
+  }
+  game.hillX += sp * 0.12 * motion * dt;
+  game.bushX += sp * 0.4 * motion * dt;
+  game.groundX = (game.groundX + sp * dt) % 64;
+
+  // Effects
+  capy.wing += dt * (13 + capy.wingBoost * 22);
+  capy.wingBoost = Math.max(0, capy.wingBoost - dt * 3);
+  game.flash = Math.max(0, game.flash - dt * 2.5);
+  game.shake = Math.max(0, game.shake - dt * 4);
+  game.scorePop = Math.max(0, game.scorePop - dt * 5);
+
+  if (game.state === 'ready') {
+    capy.y = L.readyY + Math.sin(game.t * 3) * 8;
+    capy.rot = Math.sin(game.t * 3 + 1) * 0.06;
+    return;
+  }
+
+  if (game.state === 'over') {
+    game.overT += dt;
+    if (capy.y < L.groundY - CFG.HIT_HH) {
+      capy.vy = Math.min(capy.vy + CFG.GRAVITY * dt, CFG.MAX_FALL);
+      capy.y = Math.min(capy.y + capy.vy * dt, L.groundY - CFG.HIT_HH);
+      capy.rot += (1.4 - capy.rot) * Math.min(1, dt * 6);
+    }
+    return;
+  }
+
+  // --- play state ---
+  capy.vy = Math.min(capy.vy + CFG.GRAVITY * dt, CFG.MAX_FALL);
+  capy.y += capy.vy * dt;
+  const targetRot = clamp(capy.vy / 900, -0.4, 0.9);
+  capy.rot += (targetRot - capy.rot) * Math.min(1, dt * 10);
+
+  // Pipes: fixed horizontal spacing, spawned by travelled distance
+  game.dist += sp * dt;
+  if (game.dist >= CFG.PIPE_SPACING) {
+    game.dist -= CFG.PIPE_SPACING;
+    spawnPipe(W + 10 - game.dist);
+  }
+  for (const p of game.pipes) {
+    p.x -= sp * dt;
+    if (!p.scored && p.x + CFG.PIPE_W < capy.x - CFG.HIT_HW) {
+      p.scored = true;
+      game.score++;
+      game.scorePop = 1;
+      game.speed = Math.min(CFG.SPEED_MAX, CFG.SPEED_BASE + Math.floor(game.score / 10) * CFG.SPEED_STEP);
+      Sfx.point();
+    }
+  }
+  if (game.pipes.length && game.pipes[0].x + CFG.HEAD_W < -10) game.pipes.shift();
+
+  // Collisions: ceiling, ground, pipes
+  if (capy.y - CFG.HIT_HH <= 0) { capy.y = CFG.HIT_HH; capy.vy = 0; gameOver(); return; }
+  if (capy.y + CFG.HIT_HH >= L.groundY) { capy.y = L.groundY - CFG.HIT_HH; gameOver(); return; }
+  for (const p of game.pipes) {
+    if (hitsPipe(p)) { gameOver(); return; }
+  }
+}
+
+/* =====================================================================
+ * INPUT
+ * ===================================================================== */
+function toLogical(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+}
+
+function inRect(x, y, b, pad = 6) {
+  return x >= b.x - pad && x <= b.x + b.w + pad && y >= b.y - pad && y <= b.y + b.h + pad;
+}
+
+function press(id) {
+  game.pressed = id;
+  game.pressedT = game.t + 0.12;
+}
+
+function togglePause() {
+  if (game.state === 'play') game.state = 'paused';
+  else if (game.state === 'paused') game.state = 'play';
+}
+
+function goBack() {
+  if (game.state === 'ready') {
+    if (history.length > 1) history.back();
+    return;
+  }
+  resetRun();
+}
+
+function restart() {
+  if (game.overT <= 0.6) return;
+  resetRun();
+}
+
+// Generic "action" input (tap on the playfield, Space, ArrowUp)
+function primaryAction() {
+  switch (game.state) {
+    case 'ready': startRun(); break;
+    case 'play': flap(); break;
+    case 'paused': togglePause(); break;
+    case 'over': restart(); break;
+  }
+}
+
+function onPointer(x, y) {
+  for (const b of L.buttons) {
+    if (inRect(x, y, b)) {
+      press(b.id);
+      if (b.id === 'back') goBack();
+      else if (b.id === 'pause') togglePause();
+      else if (b.id === 'sound') Sfx.toggle();
+      return;
+    }
+  }
+  if (game.state === 'over') {
+    if (inRect(x, y, L.restart, 10)) { press('restart'); restart(); }
+    return;     // only the button restarts, avoids accidental taps
+  }
+  primaryAction();
+}
+
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  Sfx.unlock();
+  const p = toLogical(e);
+  onPointer(p.x, p.y);
+}, { passive: false });
+
+// iOS sometimes needs touchend to unlock audio
+document.addEventListener('touchend', () => Sfx.unlock(), { passive: true });
+// Block pinch/zoom gestures and the context menu
+document.addEventListener('gesturestart', e => e.preventDefault());
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+
+window.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  const k = e.code;
+  if (k === 'Space' || k === 'ArrowUp' || k === 'KeyW' || k === 'Enter') {
+    e.preventDefault();
+    Sfx.unlock();
+    primaryAction();
+  } else if (k === 'KeyP' || k === 'Escape') {
+    togglePause();
+  } else if (k === 'KeyM') {
+    Sfx.toggle();
+  } else if (k === 'Backspace') {
+    goBack();
+  }
+});
+
+// Auto-pause when the app goes to the background
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && game.state === 'play') game.state = 'paused';
+});
+window.addEventListener('blur', () => { if (game.state === 'play') game.state = 'paused'; });
+
+/* =====================================================================
+ * AUDIO (Web Audio API, synthesized)
+ * ===================================================================== */
+const Sfx = {
+  ctx: null,
+  master: null,
+  noiseBuf: null,
+  muted: storeGet(CFG.STORE_MUTE, '0') === '1',
+
+  unlock() {
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = this.muted ? 0 : 0.4;
+      this.master.connect(this.ctx.destination);
+      // white noise buffer for the hit sound
+      const len = Math.floor(this.ctx.sampleRate * 0.3);
+      this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+      const d = this.noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+  },
+
+  toggle() {
+    this.muted = !this.muted;
+    storeSet(CFG.STORE_MUTE, this.muted ? '1' : '0');
+    if (this.master) this.master.gain.setTargetAtTime(this.muted ? 0 : 0.4, this.ctx.currentTime, 0.02);
+  },
+
+  tone(type, f0, f1, dur, vol, delay = 0) {
+    if (!this.ctx || this.muted) return;
+    const t0 = this.ctx.currentTime + delay;
+    const o = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t0);
+    o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g).connect(this.master);
+    o.start(t0);
+    o.stop(t0 + dur + 0.02);
+  },
+
+  noise(dur, vol) {
+    if (!this.ctx || this.muted) return;
+    const t0 = this.ctx.currentTime;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuf;
+    const f = this.ctx.createBiquadFilter();
+    f.type = 'lowpass';
+    f.frequency.setValueAtTime(2400, t0);
+    f.frequency.exponentialRampToValueAtTime(300, t0 + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    src.connect(f).connect(g).connect(this.master);
+    src.start(t0);
+    src.stop(t0 + dur);
+  },
+
+  flap()  { this.tone('triangle', 380, 820, 0.09, 0.45); },
+  point() { this.tone('square', 880, 880, 0.07, 0.18); this.tone('square', 1320, 1320, 0.14, 0.18, 0.07); },
+  hit()   { this.noise(0.22, 0.7); this.tone('sawtooth', 240, 45, 0.4, 0.35); },
+};
+
+/* =====================================================================
+ * MAIN LOOP
+ * ===================================================================== */
+let lastTime = performance.now();
+function frame(now) {
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  dt = clamp(dt, 0, 0.1);              // avoid huge jumps after tab switches
+  // Fixed sub-steps keep physics identical at 30, 60 or 144 Hz
+  while (dt > 0) {
+    const h = Math.min(dt, CFG.STEP);
+    update(h);
+    dt -= h;
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 150));
+if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+
+resize();
+initClouds();
+resetRun();
+canvas.focus();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
